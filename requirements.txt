@@ -1,0 +1,19 @@
+# 全能文档格式工厂 — Python 依赖
+# 安装: pip install -r requirements.txt
+
+# GUI 框架
+ttkbootstrap>=1.10.0
+
+# 拖拽支持（可选，不影响核心功能）
+tkinterdnd2>=0.4.0
+
+# Office 文档转 PDF（需要本地安装 Office）
+comtypes>=1.4.0
+
+# PDF 处理
+PyMuPDF>=1.24.0            # PDF 解析、图片提取
+pdf2docx>=0.5.0            # PDF → Word
+reportlab>=4.1.0            # TXT → PDF（手绘 PDF）
+
+# 图片处理
+Pillow>=10.0.0             # 图片转 PDF、格式互转

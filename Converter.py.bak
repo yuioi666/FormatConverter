@@ -1,0 +1,508 @@
+import os
+import time
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from ttkbootstrap.tooltip import ToolTip 
+from tkinterdnd2 import DND_FILES, TkinterDnD 
+from pdf2docx import Converter
+from PIL import Image
+import comtypes.client
+import multiprocessing
+import fitz  # PyMuPDF
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# --- 屏幕适配 ---
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    ScaleFactor = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100
+except:
+    ScaleFactor = 1.0
+
+# --- 格式定义 ---
+FORMAT_MAP = {
+    "Office": {
+        "Word 转 PDF": ([".docx", ".doc"], ".pdf"),
+        "Excel 转 PDF": ([".xlsx", ".xls"], ".pdf"),
+        "PPT 转 PDF": ([".pptx", ".ppt"], ".pdf"),
+        "TXT 转 PDF": ([".txt"], ".pdf"),
+    },
+    "PDF逆向": {
+        "PDF 转 Word": ([".pdf"], ".docx"),
+        "PDF 转 图片 (提取每页)": ([".pdf"], ".png"),
+        "PDF 转 TXT": ([".pdf"], ".txt"),
+    },
+    "图片": {
+        "图片 转 PDF": ([".jpg", ".jpeg", ".png", ".bmp"], ".pdf"),
+    }
+}
+ALL_MODES = []
+for cat in FORMAT_MAP.values(): ALL_MODES.extend(list(cat.keys()))
+
+class FinalApp(TkinterDnD.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("全能文档格式工厂 Ultimate (Final)")
+        w, h = int(950 * ScaleFactor), int(780 * ScaleFactor)
+        self.geometry(f"{w}x{h}")
+        self.style = ttk.Style("cosmo")
+        
+        self.file_map = {} 
+        self.is_running = False
+        self.is_paused = False
+        self.pause_event = threading.Event()
+        self.pause_event.set() # 默认允许运行
+        
+        self.start_timestamp = 0
+        self.pause_timestamp = 0 # 记录暂停时刻
+        self.total_pause_duration = 0 # 总共暂停了多久
+        
+        try:
+            pdfmetrics.registerFont(TTFont('SimHei', 'simhei.ttf'))
+            self.font_name = 'SimHei'
+        except:
+            self.font_name = 'Helvetica'
+
+        self.create_ui()
+
+    def create_ui(self):
+        # 1. 顶部拖拽区
+        drag_frame = ttk.Frame(self, bootstyle=PRIMARY)
+        drag_frame.pack(fill=X)
+        ttk.Label(drag_frame, text="📂 拖拽文件/文件夹至此 | 点击列表第一列可单独切换[自动删除]", font=("微软雅黑", 10, "bold"), bootstyle=(INVERSE, PRIMARY)).pack(ipady=8)
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind('<<Drop>>', self.on_drop)
+
+        # 2. 核心设置
+        sets_frame = ttk.Labelframe(self, text="转换配置", padding=12)
+        sets_frame.pack(fill=X, padx=10, pady=5)
+        
+        # 行1：模式与画质
+        r1 = ttk.Frame(sets_frame)
+        r1.pack(fill=X, pady=2)
+        
+        ttk.Label(r1, text="转换模式:").pack(side=LEFT)
+        self.mode_var = tk.StringVar(value="Word 转 PDF")
+        self.mode_combo = ttk.Combobox(r1, textvariable=self.mode_var, values=ALL_MODES, state="readonly", width=22)
+        self.mode_combo.pack(side=LEFT, padx=5)
+        
+        # 【修改点3】 增加数学公式慢的提示
+        self.create_help_icon(r1, "功能说明：\n• Office转PDF：调用本地Office，效果最佳\n• PDF转Word：⚠️若包含大量数学公式/矩阵，解析会非常慢，请耐心等待\n• 图片转PDF：无损合并")
+
+        ttk.Label(r1, text="画质引擎:", padding=(15,0,0,0)).pack(side=LEFT)
+        self.quality_var = tk.StringVar(value="臻享画质 (Ultra)")
+        ttk.Combobox(r1, textvariable=self.quality_var, values=["臻享画质 (Ultra)", "标准均衡 (Standard)", "极速预览 (Speed)"], state="readonly", width=18, bootstyle="info").pack(side=LEFT, padx=5)
+        self.create_help_icon(r1, "• 臻享(Ultra)：打印级清晰度，适合合同/图纸\n• 标准(Std)：日常办公\n• 极速(Speed)：屏幕预览，生成最快")
+
+        # 【修改点2】 强制默认关闭 (value=False)
+        self.master_check_var = tk.BooleanVar(value=False)
+        cb_master = ttk.Checkbutton(r1, text="默认开启[完成后自动删除]", variable=self.master_check_var, command=self.toggle_all_rows, bootstyle="round-toggle")
+        cb_master.pack(side=RIGHT, padx=5)
+        # 确保UI显示状态同步
+        cb_master.invoke() 
+        if self.master_check_var.get(): cb_master.invoke() # 如果意外开启了，强制关掉
+
+        # 行2：输出路径
+        r2 = ttk.Frame(sets_frame)
+        r2.pack(fill=X, pady=8)
+        ttk.Label(r2, text="输出路径:").pack(side=LEFT)
+        self.out_mode = tk.StringVar(value="origin")
+        ttk.Radiobutton(r2, text="原文件夹", variable=self.out_mode, value="origin", command=self.toggle_path).pack(side=LEFT, padx=5)
+        ttk.Radiobutton(r2, text="指定目录:", variable=self.out_mode, value="custom", command=self.toggle_path).pack(side=LEFT, padx=5)
+        self.custom_path_var = tk.StringVar()
+        self.entry_path = ttk.Entry(r2, textvariable=self.custom_path_var, state=DISABLED)
+        self.entry_path.pack(side=LEFT, fill=X, expand=True, padx=5)
+        self.btn_browse = ttk.Button(r2, text="...", width=4, state=DISABLED, command=self.browse_path, bootstyle=OUTLINE)
+        self.btn_browse.pack(side=LEFT)
+
+        # 3. 列表区
+        list_frame = ttk.Frame(self, padding=5)
+        list_frame.pack(fill=BOTH, expand=True, padx=10)
+        
+        cols = ("del", "path", "status", "info")
+        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="extended")
+        
+        self.tree.heading("del", text="自动删除?", anchor=CENTER)
+        self.tree.heading("path", text="文件名称 / 路径")
+        self.tree.heading("status", text="状态")
+        self.tree.heading("info", text="耗时/备注")
+        
+        self.tree.column("del", width=80, anchor=CENTER, stretch=False)
+        self.tree.column("path", width=400)
+        self.tree.column("status", width=100, anchor=CENTER)
+        self.tree.column("info", width=150, anchor=CENTER)
+        
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.tag_configure("checked", foreground="red")
+        self.tree.tag_configure("processing", foreground="#007bff")
+        self.tree.tag_configure("success", foreground="#28a745")
+        self.tree.tag_configure("deleted", foreground="#6c757d")
+        self.tree.tag_configure("paused", foreground="#e0a800")
+
+        self.tree.pack(side=LEFT, fill=BOTH, expand=True)
+        sb = ttk.Scrollbar(list_frame, orient=VERTICAL, command=self.tree.yview)
+        sb.pack(side=RIGHT, fill=Y)
+        self.tree.configure(yscrollcommand=sb.set)
+
+        # 4. 底部工具栏
+        tool_frame = ttk.Frame(self, padding=10)
+        tool_frame.pack(fill=X)
+        
+        ttk.Button(tool_frame, text="+ 文件", bootstyle=INFO, command=self.add_files).pack(side=LEFT, padx=2)
+        ttk.Button(tool_frame, text="+ 文件夹", bootstyle=INFO, command=self.add_folder).pack(side=LEFT, padx=2)
+        ttk.Button(tool_frame, text="清空列表", bootstyle=SECONDARY, command=self.clear_list).pack(side=LEFT, padx=10)
+        
+        self.progress = ttk.Progressbar(tool_frame, orient=HORIZONTAL, mode='determinate')
+        self.progress.pack(side=LEFT, fill=X, expand=True, padx=20)
+        
+        # 【修改点1】 暂停按钮
+        self.btn_pause = ttk.Button(tool_frame, text="⏸ 暂停", bootstyle=WARNING, state=DISABLED, command=self.toggle_pause)
+        self.btn_pause.pack(side=RIGHT, padx=5)
+
+        self.btn_start = ttk.Button(tool_frame, text="🚀 开始转换", bootstyle=SUCCESS, command=self.start_thread)
+        self.btn_start.pack(side=RIGHT, ipadx=15)
+
+        # 状态栏
+        status_bar = ttk.Frame(self)
+        status_bar.pack(side=BOTTOM, fill=X, padx=10, pady=5)
+        self.status_var = tk.StringVar(value="准备就绪")
+        self.time_var = tk.StringVar(value="") 
+        
+        ttk.Label(status_bar, textvariable=self.status_var, font=("微软雅黑", 8), foreground="gray").pack(side=LEFT)
+        ttk.Label(status_bar, textvariable=self.time_var, font=("Consolas", 9, "bold"), foreground="#007bff").pack(side=RIGHT)
+
+    def create_help_icon(self, parent, text):
+        btn = ttk.Label(parent, text="[?]", font=("Arial", 9, "bold"), foreground="#17a2b8", cursor="hand2")
+        btn.pack(side=LEFT, padx=2)
+        ToolTip(btn, text=text, bootstyle=(INFO, INVERSE))
+
+    # --- 逻辑控制 ---
+    def toggle_path(self):
+        state = NORMAL if self.out_mode.get() == "custom" else DISABLED
+        self.entry_path.config(state=state)
+        self.btn_browse.config(state=state)
+
+    def browse_path(self):
+        p = filedialog.askdirectory()
+        if p: self.custom_path_var.set(p)
+
+    def get_exts(self):
+        mode = self.mode_var.get()
+        for cat in FORMAT_MAP.values():
+            if mode in cat: return cat[mode][0]
+        return []
+
+    # 【修改点1】 暂停逻辑
+    def toggle_pause(self):
+        if self.is_paused:
+            # 继续
+            self.is_paused = False
+            self.pause_event.set()
+            self.btn_pause.config(text="⏸ 暂停", bootstyle=WARNING)
+            self.status_var.set("任务继续...")
+            # 计算暂停了多久，从总耗时中扣除
+            self.total_pause_duration += (time.time() - self.pause_timestamp)
+        else:
+            # 暂停
+            self.is_paused = True
+            self.pause_event.clear()
+            self.btn_pause.config(text="▶ 继续", bootstyle=SUCCESS)
+            self.status_var.set("任务已暂停 (点击继续恢复)")
+            self.pause_timestamp = time.time()
+
+    def toggle_all_rows(self):
+        val = self.master_check_var.get()
+        icon = "☑ 是" if val else "☐ 否"
+        for iid in self.tree.get_children():
+            curr_status = self.tree.item(iid, "values")[2]
+            if curr_status in ["待处理", "状态"]:
+                self.tree.set(iid, "del", icon)
+                if val: self.tree.item(iid, tags=("checked",))
+                else: self.tree.item(iid, tags=())
+
+    def on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "cell":
+            col = self.tree.identify_column(event.x)
+            if col == "#1":
+                iid = self.tree.identify_row(event.y)
+                if not iid: return
+                curr_status = self.tree.item(iid, "values")[2]
+                if curr_status not in ["待处理"]: return 
+                curr_val = self.tree.set(iid, "del")
+                if "☐" in curr_val:
+                    self.tree.set(iid, "del", "☑ 是")
+                    self.tree.item(iid, tags=("checked",))
+                else:
+                    self.tree.set(iid, "del", "☐ 否")
+                    self.tree.item(iid, tags=())
+
+    def add_to_list(self, files):
+        exts = self.get_exts()
+        is_checked = self.master_check_var.get()
+        icon = "☑ 是" if is_checked else "☐ 否"
+        tag = ("checked",) if is_checked else ()
+        
+        c = 0
+        for p in files:
+            p = os.path.normpath(p)
+            if os.path.isdir(p):
+                for r, _, f in os.walk(p):
+                    for n in f:
+                        if any(n.lower().endswith(e) for e in exts):
+                            self.insert_row(os.path.join(r, n), icon, tag)
+                            c += 1
+            elif any(p.lower().endswith(e) for e in exts):
+                self.insert_row(p, icon, tag)
+                c += 1
+        self.status_var.set(f"已添加 {c} 个文件")
+
+    def insert_row(self, path, icon, tag):
+        for iid in self.file_map:
+            if self.file_map[iid] == path: return
+        iid = self.tree.insert("", END, values=(icon, path, "待处理", ""), tags=tag)
+        self.file_map[iid] = path
+
+    def add_files(self):
+        ft = [("Files", " ".join([f"*{e}" for e in self.get_exts()]))]
+        fs = filedialog.askopenfilenames(filetypes=ft)
+        self.add_to_list(fs)
+
+    def add_folder(self):
+        d = filedialog.askdirectory()
+        if d: self.add_to_list([d])
+
+    def on_drop(self, event):
+        self.add_to_list(self.tk.splitlist(event.data))
+
+    def clear_list(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        self.file_map.clear()
+        self.progress['value'] = 0
+        self.time_var.set("")
+
+    def start_thread(self):
+        if not self.tree.get_children(): return
+        if self.out_mode.get() == "custom" and not self.custom_path_var.get():
+            messagebox.showerror("错误", "请选择输出路径")
+            return
+        
+        self.is_running = True
+        self.is_paused = False
+        self.pause_event.set()
+        self.total_pause_duration = 0
+        
+        self.btn_start.config(state=DISABLED)
+        self.btn_pause.config(state=NORMAL, text="⏸ 暂停", bootstyle=WARNING)
+        
+        threading.Thread(target=self.run, daemon=True).start()
+        self.update_timer()
+
+    def get_out_path(self, in_path):
+        mode = self.mode_var.get()
+        target_ext = ""
+        for cat in FORMAT_MAP.values():
+            if mode in cat:
+                target_ext = cat[mode][1]
+                break
+        
+        name = os.path.splitext(os.path.basename(in_path))[0]
+        folder = self.custom_path_var.get() if self.out_mode.get() == "custom" else os.path.dirname(in_path)
+            
+        if mode == "PDF 转 图片 (提取每页)":
+            sub = os.path.join(folder, f"{name}_Img")
+            if not os.path.exists(sub): os.makedirs(sub)
+            return sub
+            
+        return os.path.join(folder, name + target_ext)
+
+    def update_timer(self):
+        if not self.is_running: return
+        
+        # 如果暂停中，不更新时间显示
+        if self.is_paused:
+            self.after(500, self.update_timer)
+            return
+
+        # 计算实际运行时间 (当前时间 - 开始时间 - 暂停总耗时)
+        elapsed = int(time.time() - self.start_timestamp - self.total_pause_duration)
+        items = self.tree.get_children()
+        total = len(items)
+        done = self.progress['value']
+        
+        m, s = divmod(elapsed, 60)
+        time_str = f"已用: {m:02d}:{s:02d}"
+        
+        if done > 0:
+            avg_per_file = elapsed / done
+            remain_files = total - done
+            remain_sec = int(avg_per_file * remain_files)
+            rm, rs = divmod(remain_sec, 60)
+            time_str += f" | 预计剩余: {rm:02d}:{rs:02d}"
+        else:
+            time_str += " | 计算中..."
+            
+        self.time_var.set(time_str)
+        self.after(1000, self.update_timer)
+
+    def run(self):
+        mode = self.mode_var.get()
+        quality = self.quality_var.get()
+        items = self.tree.get_children()
+        total = len(items)
+        self.progress['maximum'] = total
+        self.start_timestamp = time.time()
+        
+        is_office = mode in FORMAT_MAP["Office"]
+        app = None
+        
+        if is_office:
+            comtypes.CoInitialize()
+            try:
+                if "Word" in mode: app = comtypes.client.CreateObject("Word.Application")
+                elif "Excel" in mode: app = comtypes.client.CreateObject("Excel.Application")
+                elif "PPT" in mode: app = comtypes.client.CreateObject("Powerpoint.Application")
+                if app: app.Visible = False
+            except: pass
+
+        for i, iid in enumerate(items):
+            if not self.is_running: break
+            
+            # 【修改点1】 暂停检测点：在处理下一个文件前，检查是否暂停
+            self.pause_event.wait() 
+            
+            f_path = self.file_map[iid]
+            need_delete = "☑" in self.tree.item(iid, "values")[0]
+            
+            self.tree.set(iid, "status", "处理中...")
+            self.tree.item(iid, tags=("processing",))
+            self.tree.see(iid)
+            self.status_var.set(f"正在处理: {os.path.basename(f_path)}")
+            
+            out_path = self.get_out_path(f_path)
+            success = False
+            
+            start_t = time.time()
+            try:
+                if is_office:
+                    success = self.convert_office(app, mode, quality, f_path, out_path)
+                else:
+                    success = self.convert_parallel(mode, quality, f_path, out_path)
+                
+                cost = time.time() - start_t
+                info_str = f"耗时 {cost:.1f}s"
+                
+                if success:
+                    if need_delete:
+                        try:
+                            os.remove(f_path)
+                            self.tree.set(iid, "status", "已删")
+                            self.tree.set(iid, "info", info_str + " (清理)")
+                            self.tree.item(iid, tags=("deleted",))
+                        except:
+                            self.tree.set(iid, "status", "完成")
+                            self.tree.set(iid, "info", info_str + " (占用)")
+                            self.tree.item(iid, tags=("success",))
+                    else:
+                        self.tree.set(iid, "status", "完成")
+                        self.tree.set(iid, "info", info_str)
+                        self.tree.item(iid, tags=("success",))
+                else:
+                    self.tree.set(iid, "status", "失败")
+                    self.tree.item(iid, tags=("checked",))
+                    
+            except Exception as e:
+                self.tree.set(iid, "status", "出错")
+                self.tree.set(iid, "info", "格式/路径错误")
+                self.tree.item(iid, tags=("checked",))
+
+            self.progress['value'] = i + 1
+
+        if app: 
+            try: app.Quit() 
+            except: pass
+        if is_office: comtypes.CoUninitialize()
+        
+        self.is_running = False
+        self.btn_start.config(state=NORMAL)
+        self.btn_pause.config(state=DISABLED, text="⏸ 暂停")
+        self.status_var.set("任务完成")
+        final_time = int(time.time() - self.start_timestamp - self.total_pause_duration)
+        self.time_var.set(f"总耗时: {final_time}秒")
+        messagebox.showinfo("完成", "所有文件处理完毕！")
+
+    def convert_office(self, app, mode, quality, f, out):
+        if "Ultra" in quality: opt, qual = 0, 0
+        elif "Standard" in quality: opt, qual = 0, 0
+        else: opt, qual = 1, 1
+        
+        if mode == "Word 转 PDF":
+            doc = app.Documents.Open(f)
+            doc.ExportAsFixedFormat(out, ExportFormat=17, OptimizeFor=opt, BitmapMissingFonts=("Ultra" in quality))
+            doc.Close(0)
+        elif mode == "Excel 转 PDF":
+            wb = app.Workbooks.Open(f)
+            wb.ExportAsFixedFormat(0, out, Quality=qual)
+            wb.Close(0)
+        elif mode == "PPT 转 PDF":
+            ppt = app.Presentations.Open(f, WithWindow=False)
+            ppt.SaveAs(out, 32)
+            ppt.Close()
+        elif mode == "TXT 转 PDF":
+            self.txt_2_pdf(f, out)
+        return True
+
+    def convert_parallel(self, mode, quality, f, out):
+        if "Ultra" in quality: mat, res = 3, 100
+        elif "Standard" in quality: mat, res = 2, 90
+        else: mat, res = 1, 70
+
+        if mode == "PDF 转 Word":
+            try:
+                cv = Converter(f)
+                cv.convert(out) 
+                cv.close()
+            except: return False
+        elif mode == "图片 转 PDF":
+            img = Image.open(f)
+            if img.mode != 'RGB': img = img.convert('RGB')
+            img.save(out, "PDF", resolution=res)
+        elif mode == "PDF 转 图片 (提取每页)":
+            doc = fitz.open(f)
+            matrix = fitz.Matrix(mat, mat)
+            for idx, p in enumerate(doc):
+                pix = p.get_pixmap(matrix=matrix)
+                pix.save(os.path.join(out, f"{idx+1}.png"))
+            doc.close()
+        elif mode == "PDF 转 TXT":
+            doc = fitz.open(f)
+            with open(out, 'w', encoding='utf-8') as tf:
+                for p in doc: tf.write(p.get_text())
+            doc.close()
+        return True
+
+    def txt_2_pdf(self, inp, outp):
+        c = canvas.Canvas(outp, pagesize=A4)
+        h = A4[1]
+        try:
+            with open(inp, 'r', encoding='utf-8') as f: l = f.readlines()
+        except:
+            with open(inp, 'r', encoding='gbk') as f: l = f.readlines()
+        y = h - 40
+        c.setFont(self.font_name, 10)
+        for line in l:
+            if y < 40: c.showPage(); y=h-40; c.setFont(self.font_name, 10)
+            c.drawString(40, y, line.strip())
+            y -= 15
+        c.save()
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    app = FinalApp()
+    app.mainloop()
