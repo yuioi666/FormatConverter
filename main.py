@@ -5,7 +5,7 @@ main.py — 全能文档格式工厂 入口
     python main.py
 
 打包 EXE:
-    pyinstaller --onefile --windowed --name=FormatConverter main.py
+    pyinstaller --clean --noconfirm FormatConverter.spec
 """
 
 import multiprocessing

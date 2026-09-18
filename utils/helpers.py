@@ -3,6 +3,7 @@ utils/helpers.py — 通用工具函数
 """
 
 import os
+import sys
 import time
 import ctypes
 
@@ -74,6 +75,15 @@ def fmt_now_timestamp() -> str:
 
 
 # ── 路径工具 ───────────────────────────────────────────
+def resource_path(relative_path: str) -> str:
+    """返回开发环境或 PyInstaller 单文件环境中的资源绝对路径。"""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
 def safe_basename(path: str) -> str:
     """安全的文件名提取，处理空路径"""
     return os.path.basename(path) if path else ""

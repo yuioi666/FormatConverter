@@ -1,0 +1,29 @@
+# Python 缓存和虚拟环境
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+
+# 构建产物
+build/
+dist/
+*.exe
+
+# 编辑器和操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 日志与临时备份
+*.log
+*.bak
+~$*

@@ -29,10 +29,17 @@ except ImportError:
 from core.formats import FORMAT_MAP, ALL_MODES, format_cache
 from core.engine import engine, Task
 from core.font_detector import init_font, get_available_fonts, set_current_font
-from utils.helpers import get_scale_factor, get_font_scale, scaled_font, fmt_time
+from utils.helpers import (
+    get_scale_factor,
+    get_font_scale,
+    scaled_font,
+    fmt_time,
+    resource_path,
+)
 from utils.logger import logger
 from gui.tree_manager import TreeManager
 from gui.widgets import LogPanel, DragDropBanner
+from version import __version__
 
 # ── 主窗口 ─────────────────────────────────────────────
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
@@ -40,7 +47,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("全能文档格式工厂 Ultimate")
+        self.title(f"全能文档格式工厂 v{__version__}")
+        try:
+            self.iconbitmap(resource_path("assets/format-converter-icon.ico"))
+        except (OSError, tk.TclError):
+            # 图标缺失不应阻止应用启动。
+            pass
         ScaleFactor = get_scale_factor()
         w, h = int(950 * ScaleFactor), int(850 * ScaleFactor)
         self.geometry(f"{w}x{h}")
