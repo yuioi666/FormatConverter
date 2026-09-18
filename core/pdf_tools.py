@@ -18,51 +18,59 @@ from core.font_detector import get_current_font
 
 def pdf_to_word(task: Task, app=None) -> bool:
     """PDF → Word（使用 pdf2docx）"""
+    cv = None
     try:
         from pdf2docx import Converter
         cv = Converter(task.file_path)
         cv.convert(task.out_path)
-        cv.close()
         return True
     except Exception as e:
-        logger.error(f"PDF 转 Word 失败: {e}")
+        task.error = f"PDF 转 Word 失败: {e}"
+        logger.error(task.error)
         return False
+    finally:
+        if cv is not None:
+            try:
+                cv.close()
+            except Exception:
+                pass
 
 
 def pdf_to_images(task: Task, app=None) -> bool:
     """PDF → 图片（每页提取）"""
     try:
         if "Ultra" in task.quality:
-            mat_val, res = 3, 100
+            mat_val = 3
         elif "Standard" in task.quality:
-            mat_val, res = 2, 90
+            mat_val = 2
         else:
-            mat_val, res = 1, 70
+            mat_val = 1
 
-        doc = fitz.open(task.file_path)
-        matrix = fitz.Matrix(mat_val, mat_val)
-        for idx, page in enumerate(doc):
-            pix = page.get_pixmap(matrix=matrix)
-            page_path = os.path.join(task.out_path, f"{idx + 1}.png")
-            pix.save(page_path)
-        doc.close()
+        os.makedirs(task.out_path, exist_ok=True)
+        with fitz.open(task.file_path) as doc:
+            matrix = fitz.Matrix(mat_val, mat_val)
+            for idx, page in enumerate(doc):
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                page_path = os.path.join(task.out_path, f"{idx + 1}.png")
+                pix.save(page_path)
         return True
     except Exception as e:
-        logger.error(f"PDF 转图片失败: {e}")
+        task.error = f"PDF 转图片失败: {e}"
+        logger.error(task.error)
         return False
 
 
 def pdf_to_txt(task: Task, app=None) -> bool:
     """PDF → TXT"""
     try:
-        doc = fitz.open(task.file_path)
-        with open(task.out_path, 'w', encoding='utf-8') as f:
-            for page in doc:
-                f.write(page.get_text())
-        doc.close()
+        with fitz.open(task.file_path) as doc:
+            with open(task.out_path, 'w', encoding='utf-8-sig') as f:
+                for page in doc:
+                    f.write(page.get_text())
         return True
     except Exception as e:
-        logger.error(f"PDF 转 TXT 失败: {e}")
+        task.error = f"PDF 转 TXT 失败: {e}"
+        logger.error(task.error)
         return False
 
 
@@ -91,24 +99,44 @@ def txt_to_pdf(task: Task, app=None) -> bool:
         c.save()
         return True
     except Exception as e:
-        logger.error(f"TXT 转 PDF 失败: {e}")
+        task.error = f"TXT 转 PDF 失败: {e}"
+        logger.error(task.error)
         return False
 
 
 def pdf_merge(task: Task, app=None) -> bool:
-    """
-    PDF 合并 (B4)
-    注意：此函数会从 task 上下文中读取所有待合并的 PDF 路径。
-    task 为多文件任务的最后一个文件，合并列表通过 engine 传递。
-    实际调用时由 engine 的合并逻辑包装。
-    """
-    # 合并由 engine 中的 _do_pdf_merge 处理
-    # 此保留以供直接调用
-    return False
+    """将 ``task.input_files`` 中的 PDF 按顺序合并。"""
+    out_doc = None
+    try:
+        pdf_paths = [
+            path for path in task.input_files
+            if path.lower().endswith(".pdf")
+        ]
+        if not pdf_paths:
+            task.error = "没有可合并的 PDF 文件"
+            logger.error(task.error)
+            return False
+
+        out_doc = fitz.open()
+        for pdf_path in pdf_paths:
+            with fitz.open(pdf_path) as source:
+                out_doc.insert_pdf(source)
+        out_doc.save(task.out_path, deflate=True)
+        logger.info(f"合并 {len(pdf_paths)} 个 PDF → {task.out_path}")
+        return True
+    except Exception as e:
+        task.error = f"PDF 合并失败: {e}"
+        logger.error(task.error)
+        return False
+    finally:
+        if out_doc is not None:
+            out_doc.close()
 
 
 def pdf_compress(task: Task, app=None) -> bool:
     """PDF 压缩 (B4) — 降低图片 DPI 重编码"""
+    doc = None
+    out_doc = None
     try:
         doc = fitz.open(task.file_path)
         out_doc = fitz.open()
@@ -129,7 +157,9 @@ def pdf_compress(task: Task, app=None) -> bool:
 
         out_doc.save(task.out_path, deflate=True, garbage=4)
         out_doc.close()
+        out_doc = None
         doc.close()
+        doc = None
 
         # 检查是否确实变小了
         orig_size = os.path.getsize(task.file_path)
@@ -139,5 +169,11 @@ def pdf_compress(task: Task, app=None) -> bool:
 
         return True
     except Exception as e:
-        logger.error(f"PDF 压缩失败: {e}")
+        task.error = f"PDF 压缩失败: {e}"
+        logger.error(task.error)
         return False
+    finally:
+        if out_doc is not None:
+            out_doc.close()
+        if doc is not None:
+            doc.close()

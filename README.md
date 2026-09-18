@@ -13,6 +13,14 @@ FormatConverter 是一个 Windows 桌面文档格式转换工具，提供 Office
 
 > Office 相关转换依赖本机安装的 Microsoft Office。
 
+## 使用说明
+
+1. 分别选择“转换前格式”和“转换后格式”，例如 Excel → PDF。
+2. 将文件或文件夹拖入窗口；软件会递归扫描文件夹，只加入与当前模式兼容的文件。
+3. 选择输出位置后开始转换。完成一批后，可以继续添加并执行下一批。
+
+“画质引擎”只会在转换实现真正使用画质参数时启用，例如 Word/Excel 转 PDF、PDF 转图片、PDF 压缩和图片转 PDF；其他模式下会自动禁用。
+
 ## 下载
 
 普通用户请前往仓库的 [Releases](https://github.com/yuioi666/FormatConverter/releases) 页面下载最新版 EXE，无需安装 Python。
@@ -45,9 +53,24 @@ pyinstaller --clean --noconfirm FormatConverter.spec
 dist/FormatConverter.exe
 ```
 
+## 测试
+
+常规回归测试：
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+本机 Office 端到端测试：
+
+```powershell
+$env:FORMATCONVERTER_OFFICE_TESTS = "1"
+python -m unittest tests.test_office_integration -v
+```
+
 ## 版本
 
-当前源码版本：`v1.0.2`
+当前源码版本：`v1.0.3`
 
 ## 项目结构
 

@@ -14,7 +14,15 @@ import queue
 from typing import Callable, Optional
 
 from utils.logger import logger
-from core.formats import FORMAT_MAP, format_cache
+
+
+OFFICE_PROGIDS = {
+    "Word 转 PDF": "Word.Application",
+    "Word 转 TXT": "Word.Application",
+    "Excel 转 PDF": "Excel.Application",
+    "Excel 转 CSV": "Excel.Application",
+    "PPT 转 PDF": "PowerPoint.Application",
+}
 
 # ── 任务数据类型 ───────────────────────────────────────
 class Task:
@@ -31,6 +39,8 @@ class Task:
         self.input_files = input_files or []
         self.start_time = 0.0
         self.cost = 0.0
+        self.error = ""
+        self.source_deleted = False
 
     @property
     def basename(self) -> str:
@@ -58,6 +68,7 @@ class ConversionEngine:
     def __init__(self):
         self._queue: queue.Queue[Task] = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
 
         # 控制标志
         self._stop_flag = False
@@ -70,6 +81,7 @@ class ConversionEngine:
         self._start_timestamp = 0.0
         self._pause_timestamp = 0.0
         self._total_pause_duration = 0.0
+        self._last_run_stopped = False
 
         self.callbacks = TaskCallbacks()
 
@@ -97,6 +109,10 @@ class ConversionEngine:
     def completed_tasks(self) -> int:
         return self._completed_tasks
 
+    @property
+    def last_run_stopped(self) -> bool:
+        return self._last_run_stopped
+
     def set_converter_funcs(self, funcs):
         """
         设置转换函数字典。
@@ -110,17 +126,21 @@ class ConversionEngine:
         self._converter_funcs = funcs
 
     # ── 控制方法 ────────────────────────────────────────
-    def start(self, tasks: list[Task]):
-        """启动转换任务队列"""
-        if self._running:
-            return
+    def start(self, tasks: list[Task]) -> bool:
+        """启动转换任务队列；成功启动返回 True。"""
+        if not tasks:
+            return False
 
-        self._stop_flag = False
-        self._pause_event.set()
-        self._running = True
-        self._completed_tasks = 0
-        self._total_tasks = len(tasks)
-        self._total_pause_duration = 0.0
+        with self._state_lock:
+            if self._running:
+                return False
+            self._stop_flag = False
+            self._pause_event.set()
+            self._running = True
+            self._completed_tasks = 0
+            self._total_tasks = len(tasks)
+            self._total_pause_duration = 0.0
+            self._last_run_stopped = False
 
         # 清空旧队列
         while not self._queue.empty():
@@ -138,6 +158,7 @@ class ConversionEngine:
 
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
+        return True
 
     def stop(self):
         """请求停止（当前文件处理完即停）"""
@@ -171,11 +192,9 @@ class ConversionEngine:
     # ── 工作线程 ────────────────────────────────────────
     def _worker_loop(self):
         """工作线程主循环"""
-        import comtypes.client as comclient
-        from core.formats import FORMAT_MAP
-
         mode = None  # 将在第一个任务中确定
-        is_office = False
+        comtypes_module = None
+        office_initialized = False
         app = None
 
         try:
@@ -183,19 +202,25 @@ class ConversionEngine:
             if not self._queue.empty():
                 first_task = self._queue.queue[0]
                 mode = first_task.mode
-                is_office = mode in FORMAT_MAP.get("Office → PDF", {})
+                prog_id = OFFICE_PROGIDS.get(mode)
 
-                if is_office:
-                    comclient.CoInitialize()
+                if prog_id:
                     try:
-                        if "Word" in mode:
-                            app = comclient.CreateObject("Word.Application")
-                        elif "Excel" in mode:
-                            app = comclient.CreateObject("Excel.Application")
-                        elif "PPT" in mode:
-                            app = comclient.CreateObject("Powerpoint.Application")
-                        if app:
+                        import comtypes
+                        import comtypes.client as comclient
+
+                        comtypes_module = comtypes
+                        comtypes.CoInitialize()
+                        office_initialized = True
+                        app = comclient.CreateObject(prog_id)
+                        try:
                             app.Visible = False
+                        except Exception:
+                            pass
+                        try:
+                            app.DisplayAlerts = False
+                        except Exception:
+                            pass
                     except Exception as e:
                         logger.error(f"无法启动 Office 应用: {e}")
                         app = None
@@ -211,38 +236,40 @@ class ConversionEngine:
                 task.start_time = time.time()
 
                 # 通知开始
-                if self.callbacks.on_start:
-                    self.callbacks.on_start(task)
+                self._call_callback(self.callbacks.on_start, task)
 
                 try:
-                    success = self._convert_single(task, app, is_office)
+                    success = self._convert_single(task, app)
                 except Exception as e:
+                    task.error = str(e)
                     logger.error(f"{task.basename}: 转换异常 — {e}")
                     success = False
 
                 task.cost = time.time() - task.start_time
+                self._completed_tasks += 1
 
                 if success:
-                    self._completed_tasks += 1
                     if task.need_delete:
-                        self._try_delete_source(task)
+                        task.source_deleted = self._try_delete_source(task)
 
-                    if self.callbacks.on_success:
-                        self.callbacks.on_success(task)
+                    self._call_callback(self.callbacks.on_success, task)
 
                     msg = f"✅ {task.basename} → 完成 ({task.cost:.1f}s)"
-                    if task.need_delete:
+                    if task.source_deleted:
                         msg += " [已删除源文件]"
                     logger.success(msg)
                 else:
-                    if self.callbacks.on_fail:
-                        self.callbacks.on_fail(task, "转换失败")
+                    reason = task.error or "转换失败，请查看处理日志"
+                    self._call_callback(self.callbacks.on_fail, task, reason)
 
                     logger.error(f"❌ {task.basename} → 转换失败 ({task.cost:.1f}s)")
 
                 # 进度通知
-                if self.callbacks.on_progress:
-                    self.callbacks.on_progress(self._completed_tasks, self._total_tasks)
+                self._call_callback(
+                    self.callbacks.on_progress,
+                    self._completed_tasks,
+                    self._total_tasks,
+                )
 
         finally:
             # 清理 COM
@@ -251,22 +278,23 @@ class ConversionEngine:
                     app.Quit()
                 except Exception:
                     pass
-            if is_office:
+            if office_initialized and comtypes_module is not None:
                 try:
-                    comclient.CoUninitialize()
+                    comtypes_module.CoUninitialize()
                 except Exception:
                     pass
 
-            self._running = False
-            self._stop_flag = False
+            with self._state_lock:
+                self._last_run_stopped = self._stop_flag
+                self._running = False
+                self._stop_flag = False
 
-            if self.callbacks.on_finish:
-                self.callbacks.on_finish()
+            self._call_callback(self.callbacks.on_finish)
 
             total_time = time.time() - self._start_timestamp - self._total_pause_duration
             logger.info(f"🏁 任务全部完成，总耗时 {total_time:.1f}秒")
 
-    def _convert_single(self, task: Task, app, is_office: bool):
+    def _convert_single(self, task: Task, app):
         """执行单个文件转换"""
         if self._converter_funcs is None:
             logger.error("转换函数未设置")
@@ -280,15 +308,28 @@ class ConversionEngine:
 
         # 兼容旧式回调
         logger.error(f"未知转换模式: {mode}")
+        task.error = f"未知转换模式: {mode}"
         return False
 
     @staticmethod
-    def _try_delete_source(task: Task):
-        """尝试删除源文件"""
+    def _call_callback(callback, *args):
+        """回调异常不能破坏转换工作线程。"""
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception as e:
+            logger.error(f"状态回调失败: {e}")
+
+    @staticmethod
+    def _try_delete_source(task: Task) -> bool:
+        """尝试删除源文件并返回是否成功。"""
         try:
             os.remove(task.file_path)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            logger.warn(f"源文件删除失败: {task.file_path} — {e}")
+            return False
 
 
 # 全局单例

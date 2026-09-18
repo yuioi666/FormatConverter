@@ -11,7 +11,7 @@ gui/tree_manager.py — Treeview 文件列表管理
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from typing import Optional
+from typing import Callable, Optional
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
@@ -23,9 +23,11 @@ from utils.logger import logger
 class TreeManager:
     """管理 Treeview 文件列表"""
 
-    def __init__(self, tree: ttk.Treeview, master_check_var: tk.BooleanVar):
+    def __init__(self, tree: ttk.Treeview, master_check_var: tk.BooleanVar,
+                 on_change: Optional[Callable[[], None]] = None):
         self.tree = tree
         self.master_check_var = master_check_var
+        self.on_change = on_change
         self.file_map: dict[str, str] = {}  # iid → file_path
         self._path_to_iid: dict[str, str] = {}  # file_path → iid（用于 O(1) 去重）
 
@@ -51,56 +53,89 @@ class TreeManager:
         skipped = 0
 
         for p in paths:
-            p = os.path.normpath(p)
+            p = os.path.abspath(os.path.normpath(p))
             if os.path.isdir(p):
                 c, s = self._add_directory(p, exts, icon, tag)
                 count += c
                 skipped += s
             else:
-                if self._is_duplicate(p):
+                if not self._match_ext(p, exts):
                     skipped += 1
                     continue
-                if self._match_ext(p, exts):
-                    self._insert_row(p, icon, tag)
-                    count += 1
-                else:
-                    skipped += 1
+                existing_iid = self._get_existing_iid(p)
+                if existing_iid:
+                    if self._requeue_completed(existing_iid, icon, tag):
+                        count += 1
+                    else:
+                        skipped += 1
+                    continue
+                self._insert_row(p, icon, tag)
+                count += 1
 
         if skipped > 0:
             logger.info(f"跳过 {skipped} 个文件（格式不匹配或重复）")
 
+        self._notify_change()
         return count
+
+    def _notify_change(self):
+        """通知界面刷新任务统计。"""
+        callback = getattr(self, "on_change", None)
+        if callback:
+            callback()
 
     def _add_directory(self, dir_path: str, exts: list[str],
                        icon: str, tag: tuple) -> tuple[int, int]:
         """递归添加目录中的匹配文件"""
         count = 0
         skipped = 0
-        for root, _, files in os.walk(dir_path):
-            for fname in files:
+        for root, dirs, files in os.walk(dir_path):
+            dirs.sort(key=str.casefold)
+            for fname in sorted(files, key=str.casefold):
                 fpath = os.path.join(root, fname)
-                if self._is_duplicate(fpath):
+                if not self._match_ext(fpath, exts):
                     skipped += 1
                     continue
-                if self._match_ext(fpath, exts):
-                    self._insert_row(fpath, icon, tag)
-                    count += 1
-                else:
-                    skipped += 1
+                existing_iid = self._get_existing_iid(fpath)
+                if existing_iid:
+                    if self._requeue_completed(existing_iid, icon, tag):
+                        count += 1
+                    else:
+                        skipped += 1
+                    continue
+                self._insert_row(fpath, icon, tag)
+                count += 1
         return count, skipped
 
     def _insert_row(self, path: str, icon: str, tag: tuple):
         """插入一行，记录映射"""
-        path = os.path.normpath(path)
+        path = os.path.abspath(os.path.normpath(path))
         iid = self.tree.insert("", tk.END,
                                values=(icon, path, "待处理", ""),
                                tags=tag)
         self.file_map[iid] = path
-        self._path_to_iid[path] = iid
+        self._path_to_iid[self._path_key(path)] = iid
 
-    def _is_duplicate(self, path: str) -> bool:
-        """O(1) 查重"""
-        return os.path.normpath(path) in self._path_to_iid
+    @staticmethod
+    def _path_key(path: str) -> str:
+        """用于 Windows 路径查重的规范键。"""
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+    def _get_existing_iid(self, path: str) -> Optional[str]:
+        return self._path_to_iid.get(self._path_key(path))
+
+    def _requeue_completed(self, iid: str, icon: str, tag: tuple) -> bool:
+        """再次添加已完成文件时，将原行恢复为待处理。"""
+        status = self.tree.set(iid, "status")
+        path = self.file_map.get(iid, "")
+        if status in ("待处理", "处理中...") or not os.path.isfile(path):
+            return False
+        self.tree.set(iid, "del", icon)
+        self.tree.set(iid, "status", "待处理")
+        self.tree.set(iid, "info", "")
+        self.tree.item(iid, tags=tag)
+        self.tree.see(iid)
+        return True
 
     @staticmethod
     def _match_ext(path: str, exts: list[str]) -> bool:
@@ -141,23 +176,27 @@ class TreeManager:
         """删除选中的行"""
         selected = self.tree.selection()
         for iid in selected:
+            if self.tree.set(iid, "status") == "处理中...":
+                continue
             path = self.file_map.pop(iid, "")
             if path:
-                self._path_to_iid.pop(path, None)
+                self._path_to_iid.pop(self._path_key(path), None)
             self.tree.delete(iid)
+        self._notify_change()
 
     def remove_completed(self):
         """删除状态为 完成/已删/出错/失败 的行"""
         to_delete = []
         for iid in self.tree.get_children():
             status = self.tree.item(iid, "values")[2]
-            if status not in ("待处理", "处理中..."):
+            if status not in ("待处理", "处理中...", "格式不匹配"):
                 to_delete.append(iid)
         for iid in to_delete:
             path = self.file_map.pop(iid, "")
             if path:
-                self._path_to_iid.pop(path, None)
+                self._path_to_iid.pop(self._path_key(path), None)
             self.tree.delete(iid)
+        self._notify_change()
 
     def clear_all(self):
         """清空全部"""
@@ -165,6 +204,7 @@ class TreeManager:
             self.tree.delete(iid)
         self.file_map.clear()
         self._path_to_iid.clear()
+        self._notify_change()
 
     def move_up(self):
         """选中的行上移"""
@@ -186,12 +226,30 @@ class TreeManager:
     # ── 状态更新 ────────────────────────────────────────
     def update_status(self, iid: str, status: str, info: str = "", tags: str = ""):
         """更新单行状态"""
+        if hasattr(self.tree, "exists") and not self.tree.exists(iid):
+            return
         self.tree.set(iid, "status", status)
         if info:
             self.tree.set(iid, "info", info)
         if tags:
             self.tree.item(iid, tags=(tags,))
         self.tree.see(iid)
+        self._notify_change()
+
+    def apply_extension_filter(self, exts: list[str]):
+        """根据当前模式标记待办文件，切回兼容模式时自动恢复。"""
+        for iid in self.tree.get_children():
+            status = self.tree.set(iid, "status")
+            if status not in ("待处理", "格式不匹配"):
+                continue
+            path = self.file_map.get(iid, "")
+            if self._match_ext(path, exts):
+                self.tree.set(iid, "status", "待处理")
+                self.tree.set(iid, "info", "")
+            else:
+                self.tree.set(iid, "status", "格式不匹配")
+                self.tree.set(iid, "info", "不适用于当前转换模式")
+        self._notify_change()
 
     # ── 右键菜单 (B2) ──────────────────────────────────
     def _create_context_menu(self):
@@ -249,6 +307,8 @@ class TreeManager:
                 if path and os.path.isfile(path):
                     need_delete = "☑" in self.tree.item(iid, "values")[0]
                     result.append((iid, path, need_delete))
+                elif path:
+                    self.update_status(iid, "文件不存在", "请重新添加文件", tags="failed")
         return result
 
     @property
